@@ -132,39 +132,367 @@ class SpotifyAdBlocker:
         return None
     
     def is_ad_playing(self) -> bool:
-        """Определение воспроизведения рекламы по заголовку окна"""
-        title = self.get_spotify_window_title()
+        """Улучшенное определение воспроизведения рекламы с множественными проверками"""
+        try:
+            # Сначала проверяем, что Spotify вообще запущен и активен
+            if not self._is_spotify_running():
+                return False
+            
+            # Метод 1: Проверка заголовка окна (самый надежный)
+            title_check = self._check_window_title()
+            
+            # Метод 2: Проверка аудио сессии
+            audio_check = self._check_audio_session()
+            
+            # Метод 3: Проверка процессов
+            process_check = self._check_process_names()
+            
+            # Метод 4: Проверка длительности трека
+            duration_check = self._check_track_duration()
+            
+            # Метод 5: Проверка состояния окна (НЕ фокуса!)
+            window_state_check = self._check_window_focus()
+            
+            # Комбинированная логика для уменьшения ложных срабатываний
+            checks = [title_check, audio_check, process_check, duration_check, window_state_check]
+            confidence_score = sum(checks)
+            
+            # Строгая логика: требуем либо очень сильные индикаторы, либо множественные подтверждения
+            is_ad = False
+            
+            # Сильные индикаторы рекламы (достаточно одного)
+            if title_check and any([audio_check, duration_check]):
+                # Заголовок окна + аудио или паттерн трека
+                is_ad = True
+            elif confidence_score >= 3 and title_check:
+                # 3+ методов + заголовок окна
+                is_ad = True
+            elif confidence_score >= 4:
+                # 4+ методов (очень высокая уверенность)
+                is_ad = True
+            
+            # Дополнительная защита от ложных срабатываний
+            if is_ad:
+                # Проверяем, что это не ложное срабатывание из-за переключения окон
+                current_time = time.time()
+                if hasattr(self, '_last_window_switch') and (current_time - self._last_window_switch) < 2.0:
+                    # Недавно было переключение окон, игнорируем
+                    return False
+            
+            if is_ad and not hasattr(self, '_last_ad_detection'):
+                self.log(f"Реклама обнаружена: окно={title_check}, аудио={audio_check}, процесс={process_check}, длительность={duration_check}, состояние_окна={window_state_check}")
+                self._last_ad_detection = time.time()
+            elif not is_ad and hasattr(self, '_last_ad_detection'):
+                delattr(self, '_last_ad_detection')
+                
+            return is_ad
+            
+        except Exception as e:
+            self.log(f"Ошибка определения рекламы: {e}", "ERROR")
+            return False
+    
+    def _get_spotify_window_title(self):
+        """Получение заголовка окна Spotify"""
+        try:
+            import win32gui
+            
+            def enum_windows_callback(hwnd, windows):
+                if win32gui.IsWindowVisible(hwnd):
+                    window_text = win32gui.GetWindowText(hwnd)
+                    if 'spotify' in window_text.lower():
+                        windows.append(window_text)
+                return True
+            
+            windows = []
+            win32gui.EnumWindows(enum_windows_callback, windows)
+            
+            return windows[0] if windows else None
+            
+        except ImportError:
+            return None
+        except Exception as e:
+            self.log(f"Ошибка получения заголовка окна: {e}", "ERROR")
+            return None
+    
+    def _check_window_title(self) -> bool:
+        """Проверка заголовка окна на наличие рекламы"""
+        title = self._get_spotify_window_title()
         if not title:
             return False
         
-        # Признаки рекламы в заголовке
-        ad_indicators = [
+        title_lower = title.lower().strip()
+        
+        # Точные индикаторы рекламы
+        exact_ad_indicators = [
             'advertisement',
             'spotify ad',
-            'sponsored',
-            'реклама',
-            '• Spotify'
+            'sponsored'
         ]
         
-        title_lower = title.lower()
-        for indicator in ad_indicators:
+        for indicator in exact_ad_indicators:
             if indicator in title_lower:
                 return True
         
-        # Если заголовок содержит только "Spotify" без названия трека
-        if title.strip().lower() == 'spotify':
+        # Проверка на паузу или отсутствие трека (может быть реклама)
+        if title_lower in ['spotify', 'spotify free', 'spotify premium']:
+            return True
+            
+        # Проверка на рекламные паттерны
+        ad_patterns = [
+            'spotify.com',
+            'premium',
+            'upgrade',
+            'ad-free'
+        ]
+        
+        # Если заголовок содержит только рекламные паттерны без музыкальной информации
+        if any(pattern in title_lower for pattern in ad_patterns) and ' - ' not in title:
             return True
             
         return False
     
-    def mute_system_audio(self):
-        """Отключение звука системы"""
+    def _check_audio_session(self) -> bool:
+        """Проверка аудио сессии для определения рекламы"""
+        try:
+            from pycaw.pycaw import AudioUtilities
+            
+            sessions = AudioUtilities.GetAllSessions()
+            for session in sessions:
+                if session.Process and 'spotify' in session.Process.name().lower():
+                    # Проверяем состояние аудио сессии
+                    volume = session.SimpleAudioVolume
+                    if volume:
+                        # Если громкость очень низкая, это может быть реклама
+                        current_volume = volume.GetMasterVolume()
+                        if current_volume < 0.1:  # Очень тихо
+                            return True
+                            
+                        # Проверяем активность аудио потока
+                        # Если нет активного воспроизведения, но процесс активен
+                        if hasattr(session, 'State') and session.State == 0:  # Неактивен
+                            return True
+                            
+        except ImportError:
+            self.log("pycaw не установлен, пропуск проверки аудио сессии", "WARNING")
+        except Exception as e:
+            self.log(f"Ошибка проверки аудио сессии: {e}", "DEBUG")
+            
+        return False
+    
+    def _check_process_names(self) -> bool:
+        """Проверка имен процессов Spotify на наличие рекламных индикаторов"""
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                if 'spotify' in proc.info['name'].lower():
+                    cmdline = proc.info.get('cmdline', [])
+                    if cmdline:
+                        cmdline_str = ' '.join(cmdline).lower()
+                        # Проверяем командную строку на рекламные индикаторы
+                        if any(indicator in cmdline_str for indicator in 
+                               ['ad', 'advertisement', 'sponsored', 'promo']):
+                            return True
+            return False
+        except Exception as e:
+            self.log(f"Ошибка проверки процессов: {e}", "ERROR")
+            return False
+    
+    def _check_track_duration(self) -> bool:
+        """Проверка паттернов трека для определения рекламы"""
+        try:
+            # Получаем заголовок окна для анализа
+            window_title = self._get_spotify_window_title()
+            if not window_title:
+                return False
+            
+            window_title_lower = window_title.lower().strip()
+            
+            # Стандартные заголовки Spotify (не реклама)
+            standard_titles = ['spotify', 'spotify free', 'spotify premium']
+            if window_title_lower in standard_titles:
+                return False
+            
+            # Сильные индикаторы рекламы в заголовке
+            strong_ad_patterns = [
+                r'\b(advertisement|sponsored)\b',
+                r'spotify\s*(premium|ad)\b',
+                r'\b(upgrade|subscribe)\s*(now|today)?\b',
+                r'\b(get|try)\s*premium\b',
+                r'\bad[\s-]?free\b'
+            ]
+            
+            import re
+            
+            # Проверяем на сильные рекламные паттерны
+            for pattern in strong_ad_patterns:
+                if re.search(pattern, window_title_lower):
+                    return True
+            
+            # Проверяем структуру заголовка
+            # Обычная музыка: "Артист - Название трека"
+            # Реклама часто не имеет такой структуры
+            
+            # Если есть разделитель " - ", это скорее всего музыка
+            if ' - ' in window_title:
+                # Дополнительная проверка: даже с разделителем может быть реклама
+                parts = window_title.split(' - ')
+                if len(parts) == 2:
+                    artist, track = parts[0].strip(), parts[1].strip()
+                    
+                    # Проверяем, не содержат ли части рекламные слова
+                    ad_keywords = ['premium', 'upgrade', 'ad', 'advertisement', 'subscribe']
+                    if any(keyword in artist.lower() or keyword in track.lower() for keyword in ad_keywords):
+                        return True
+                
+                return False  # Обычная структура трека
+            
+            # Если нет разделителя, проверяем дополнительные критерии
+            # Короткие заголовки без структуры могут быть рекламой
+            if len(window_title.strip()) < 10:
+                return True
+            
+            # Заголовки, содержащие только URL или промо-текст
+            url_patterns = [r'spotify\.com', r'www\.', r'http', r'\.com', r'\.net']
+            if any(re.search(pattern, window_title_lower) for pattern in url_patterns):
+                return True
+            
+            # Заголовки с призывами к действию без музыкальной информации
+            action_patterns = [
+                r'\b(listen|hear|discover|explore)\b.*\b(more|now|today)\b',
+                r'\b(unlimited|endless|millions)\b.*\b(songs|music|tracks)\b'
+            ]
+            
+            for pattern in action_patterns:
+                if re.search(pattern, window_title_lower):
+                    return True
+                
+            return False
+        except Exception as e:
+            self.log(f"Ошибка проверки паттернов трека: {e}", "ERROR")
+            return False
+    
+    def _is_spotify_running(self) -> bool:
+        """Проверка, что Spotify запущен и активен"""
+        try:
+            for proc in psutil.process_iter(['pid', 'name']):
+                if 'spotify' in proc.info['name'].lower():
+                    return True
+            return False
+        except Exception:
+            return False
+    
+    def _check_window_focus(self) -> bool:
+        """Проверка состояния окна Spotify (НЕ фокуса, а внутреннего состояния)"""
+        try:
+            import win32gui
+            import win32con
+            
+            # Отслеживаем переключения окон
+            try:
+                foreground_window = win32gui.GetForegroundWindow()
+                foreground_title = win32gui.GetWindowText(foreground_window)
+                
+                # Если активно окно PowerShell или другое не-Spotify окно
+                if 'powershell' in foreground_title.lower() or 'cmd' in foreground_title.lower():
+                    self._last_window_switch = time.time()
+                    return False  # Не считаем это индикатором рекламы
+            except Exception:
+                pass
+            
+            def enum_windows_callback(hwnd, windows):
+                if win32gui.IsWindowVisible(hwnd):
+                    window_text = win32gui.GetWindowText(hwnd)
+                    if 'spotify' in window_text.lower():
+                        windows.append((hwnd, window_text))
+                return True
+            
+            windows = []
+            win32gui.EnumWindows(enum_windows_callback, windows)
+            
+            for hwnd, title in windows:
+                # Проверяем состояние окна
+                placement = win32gui.GetWindowPlacement(hwnd)
+                if placement[1] == win32con.SW_SHOWMINIMIZED:
+                    # Окно свернуто, не проверяем размеры
+                    continue
+                
+                # Проверяем размер окна только если окно видимо
+                # Реклама может создавать дополнительные маленькие окна
+                rect = win32gui.GetWindowRect(hwnd)
+                width = rect[2] - rect[0]
+                height = rect[3] - rect[1]
+                
+                # Очень маленькие окна могут быть рекламными попапами
+                # Но только если это не основное окно Spotify
+                if width < 200 or height < 150:
+                    # Дополнительная проверка: это не основное окно Spotify
+                    if 'spotify' == title.lower().strip():
+                        continue  # Это основное окно, пропускаем
+                    # Дополнительная проверка на рекламные индикаторы в заголовке
+                    if any(ad_word in title.lower() for ad_word in ['ad', 'advertisement', 'premium', 'upgrade']):
+                        return True
+                    
+                # Проверяем на необычно большие окна (полноэкранная реклама)
+                try:
+                    import win32api
+                    screen_width = win32api.GetSystemMetrics(0)
+                    screen_height = win32api.GetSystemMetrics(1)
+                except ImportError:
+                    # Fallback: используем стандартные размеры экрана
+                    screen_width = 1920
+                    screen_height = 1080
+                
+                if width > screen_width * 0.9 and height > screen_height * 0.9:
+                    # Полноэкранное окно может быть рекламой
+                    if 'advertisement' in title.lower() or 'ad' in title.lower():
+                        return True
+            
+            return False
+        except ImportError:
+            # win32gui не установлен, пропускаем эту проверку
+            return False
+        except Exception as e:
+            self.log(f"Ошибка проверки состояния окна: {e}", "ERROR")
+            return False
+    
+    def mute_spotify_audio(self):
+        """Отключение звука только для Spotify (более точное решение)"""
+        try:
+            # Метод 1: Использование pycaw для отключения конкретно Spotify
+            from pycaw.pycaw import AudioUtilities
+            
+            sessions = AudioUtilities.GetAllSessions()
+            spotify_muted = False
+            
+            for session in sessions:
+                if session.Process and 'spotify' in session.Process.name().lower():
+                    volume = session.SimpleAudioVolume
+                    if volume:
+                        volume.SetMute(1, None)
+                        spotify_muted = True
+                        self.log("Spotify отключен (реклама обнаружена)")
+                        break
+            
+            if not spotify_muted:
+                # Fallback: отключение системного звука если не удалось найти Spotify
+                self._mute_system_fallback()
+            
+            self.muted = True
+            
+        except ImportError:
+            self.log("pycaw не установлен, использую системное отключение", "WARNING")
+            self._mute_system_fallback()
+        except Exception as e:
+            self.log(f"Ошибка отключения Spotify: {e}", "ERROR")
+            self._mute_system_fallback()
+    
+    def _mute_system_fallback(self):
+        """Резервный метод отключения системного звука"""
         try:
             # Используем nircmd для управления звуком (не требует прав администратора)
             subprocess.run(['nircmd.exe', 'mutesysvolume', '1'], 
                          capture_output=True, check=False)
             self.muted = True
-            self.log("Звук отключен (реклама обнаружена)")
+            self.log("Системный звук отключен (резервный метод)")
         except FileNotFoundError:
             # Альтернативный метод через PowerShell
             try:
@@ -186,13 +514,44 @@ class SpotifyAdBlocker:
             except Exception as e:
                 self.log(f"Не удалось отключить звук: {e}", "ERROR")
     
-    def unmute_system_audio(self):
-        """Включение звука системы"""
+    def unmute_spotify_audio(self):
+        """Включение звука для Spotify"""
+        try:
+            # Метод 1: Использование pycaw для включения конкретно Spotify
+            from pycaw.pycaw import AudioUtilities
+            
+            sessions = AudioUtilities.GetAllSessions()
+            spotify_unmuted = False
+            
+            for session in sessions:
+                if session.Process and 'spotify' in session.Process.name().lower():
+                    volume = session.SimpleAudioVolume
+                    if volume:
+                        volume.SetMute(0, None)
+                        spotify_unmuted = True
+                        self.log("Spotify включен")
+                        break
+            
+            if not spotify_unmuted:
+                # Fallback: включение системного звука
+                self._unmute_system_fallback()
+            
+            self.muted = False
+            
+        except ImportError:
+            self.log("pycaw не установлен, использую системное включение", "WARNING")
+            self._unmute_system_fallback()
+        except Exception as e:
+            self.log(f"Ошибка включения Spotify: {e}", "ERROR")
+            self._unmute_system_fallback()
+    
+    def _unmute_system_fallback(self):
+        """Резервный метод включения системного звука"""
         try:
             subprocess.run(['nircmd.exe', 'mutesysvolume', '0'], 
                          capture_output=True, check=False)
             self.muted = False
-            self.log("Звук включен")
+            self.log("Системный звук включен")
         except FileNotFoundError:
             try:
                 ps_command = """
@@ -306,29 +665,49 @@ class SpotifyAdBlocker:
         return None
     
     def monitor_spotify(self):
-        """Мониторинг Spotify и блокировка рекламы"""
-        self.log("Запуск мониторинга Spotify...")
+        """Мониторинг Spotify и управление звуком"""
+        self.log("Начат мониторинг Spotify")
+        
+        # Счетчики для защиты от ложных срабатываний
+        ad_detection_count = 0
+        music_detection_count = 0
+        required_confirmations = 3  # Требуется 3 подтверждения для смены состояния
         
         while self.is_running:
             try:
                 if self.check_spotify_running():
-                    if self.is_ad_playing():
-                        if not self.muted:
-                            self.mute_system_audio()
+                    is_ad = self.is_ad_playing()
+                    
+                    if is_ad:
+                        ad_detection_count += 1
+                        music_detection_count = 0
+                        
+                        # Отключаем звук только после нескольких подтверждений
+                        if ad_detection_count >= required_confirmations and not self.muted:
+                            self.mute_spotify_audio()
+                            self.log(f"Реклама обнаружена после {ad_detection_count} проверок")
                     else:
-                        if self.muted:
-                            self.unmute_system_audio()
+                        music_detection_count += 1
+                        ad_detection_count = 0
+                        
+                        # Включаем звук только после нескольких подтверждений
+                        if music_detection_count >= required_confirmations and self.muted:
+                            self.unmute_spotify_audio()
+                            self.log(f"Музыка обнаружена после {music_detection_count} проверок")
                 else:
+                    # Spotify не запущен
                     if self.muted:
-                        self.unmute_system_audio()
+                        self.unmute_spotify_audio()
+                    ad_detection_count = 0
+                    music_detection_count = 0
                 
-                time.sleep(1)  # Проверка каждую секунду
+                time.sleep(0.5)  # Более частая проверка для быстрого реагирования
                 
             except KeyboardInterrupt:
                 break
             except Exception as e:
                 self.log(f"Ошибка мониторинга: {e}", "ERROR")
-                time.sleep(5)
+                time.sleep(5)  # Пауза при ошибке
     
     def start(self):
         """Запуск блокировщика рекламы"""
@@ -380,7 +759,7 @@ class SpotifyAdBlocker:
         
         # Включаем звук если он был отключен
         if self.muted:
-            self.unmute_system_audio()
+            self.unmute_spotify_audio()
         
         self.log("Блокировщик остановлен")
 
